@@ -1,0 +1,15 @@
+{
+  "comment": "Add this block to claude_desktop_config.json (Claude Desktop -> Settings -> Developer -> Edit Config). Adjust the path to where you cloned this repo. On Windows use double backslashes in paths.",
+  "mcpServers": {
+    "cheat-engine": {
+      "command": "python",
+      "args": ["-m", "ce_mcp"],
+      "env": {
+        "PYTHONPATH": "C:\\path\\to\\MCP\\src",
+        "CE_MCP_HOST": "127.0.0.1",
+        "CE_MCP_PORT": "37712",
+        "CE_MCP_TIMEOUT": "60"
+      }
+    }
+  }
+}
