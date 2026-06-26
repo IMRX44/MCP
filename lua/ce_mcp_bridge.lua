@@ -41,7 +41,7 @@ local function is_arr(t)
     if type(k)~="number" or k~=math.floor(k) or k<1 then return false end
     if k>n then n=k end
   end
-  return n==#t, n
+  return (n == #t), n
 end
 json_encode = function(v)
   local t=type(v)
@@ -49,7 +49,7 @@ json_encode = function(v)
   elseif t=="boolean" then return v and "true" or "false"
   elseif t=="number" then
     if v~=v or v==math.huge or v==-math.huge then return "null" end
-    if v%1==0 and math.abs(v)<2^53 then return ("%d"):format(v) end
+    if v%1==0 and math.abs(v)<9007199254740992 then return ("%d"):format(v) end
     return ("%.17g"):format(v)
   elseif t=="string" then return esc(v)
   elseif t=="table" then
@@ -90,7 +90,16 @@ local function json_decode(str)
       if c=='"' then pos=pos+1; return table.concat(buf)
       elseif c=='\\' then
         local n=str:sub(pos+1,pos+1)
-        local map={n='\n',t='\t',r='\r',b='\b',f='\f',['"']='"',['\\']='\\',['/']=='/'}
+        local esc_char
+        if     n=='n'  then esc_char='\n'
+        elseif n=='t'  then esc_char='\t'
+        elseif n=='r'  then esc_char='\r'
+        elseif n=='b'  then esc_char='\b'
+        elseif n=='f'  then esc_char='\f'
+        elseif n=='"'  then esc_char='"'
+        elseif n=='/'  then esc_char='/'
+        elseif n=='\\' then esc_char='\\'
+        end
         if n=='u' then
           local h=str:sub(pos+2,pos+5)
           local cp=tonumber(h,16) or 0
@@ -102,7 +111,7 @@ local function json_decode(str)
               0x80+math.floor(cp/0x40)%0x40,0x80+cp%0x40)
           end
           pos=pos+4
-        else buf[#buf+1]=map[n] or n end
+        else buf[#buf+1]=esc_char or n end
         pos=pos+2
       else buf[#buf+1]=c; pos=pos+1 end
     end
@@ -333,7 +342,7 @@ CMD.memory_write = function(p)
   local addr=to_addr(p.address); if not addr then error("invalid address") end
   if p.value==nil then error("missing value") end
   local vt=(p.type or "4byte"):lower()
-  if vt=="byte" then writeBytes(addr,tonumber(p.value)&0xFF)
+  if vt=="byte" then writeBytes(addr,math.floor(tonumber(p.value)) % 256)
   elseif vt=="word" or vt=="2byte" then writeSmallInteger(addr,tonumber(p.value))
   elseif vt=="dword" or vt=="4byte" or vt=="int" then writeInteger(addr,tonumber(p.value))
   elseif vt=="qword" or vt=="8byte" then writeQword(addr,tonumber(p.value))
