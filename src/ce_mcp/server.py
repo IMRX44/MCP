@@ -64,6 +64,10 @@ mcp = FastMCP(
         "auto_assemble for code injection. Always attach to a process first."
     ),
 )
+# FastMCP currently has no public ``version=`` constructor argument, although
+# its low-level MCP server does. Set it explicitly so the initialize handshake
+# advertises ce-mcp's version instead of falling back to the SDK's version.
+mcp._mcp_server.version = __version__
 
 _client: CheatEngineClient | None = None
 
@@ -416,8 +420,8 @@ async def scan_next(
 @mcp.tool()
 async def scan_status() -> Any:
     """Report the active scan: status, progress percentage, match count and
-    elapsed time. Poll this while a scan reports 'running'. With no MCP scan
-    active it reports Cheat Engine's own GUI scan instead."""
+    elapsed time. Poll this while a scan reports 'running' or 'cancelling'.
+    With no MCP scan active it reports Cheat Engine's own GUI scan instead."""
     return await _call("scan_status")
 
 
@@ -428,7 +432,8 @@ async def scan_cancel(force: bool = False) -> Any:
     Use this rather than abandoning a call — a scan started here keeps running
     in CE and will block every later request until it finishes.
 
-    The default asks the scanner to stop at its next safe point. Only pass
+    The default asks the scanner to stop at its next safe point and returns
+    status='cancelling'; poll scan_status until it becomes 'cancelled'. Only pass
     ``force=True`` if a graceful stop will not take: Cheat Engine then pops a
     modal warning that later scans may misbehave and recommends restarting it.
     """
@@ -457,9 +462,11 @@ async def scan_save_results(name: str) -> Any:
 async def scan_reset(force: bool = False) -> Any:
     """Discard the active scan and free its result file.
 
-    A scan that is still running is asked to stop first, gracefully. Finished
-    scans are simply released — they are never terminated, which is what makes
-    Cheat Engine warn about subsequent scans misbehaving.
+    A running scan is first asked to stop gracefully; while it is still
+    unwinding this returns reset=False and status='cancelling'. Poll scan_status
+    and call scan_reset again after it settles. Finished scans are simply
+    released. ``force=True`` is an explicit last resort because Cheat Engine
+    warns that later scans may misbehave after forced termination.
     """
     return await _call("scan_reset", force=force)
 

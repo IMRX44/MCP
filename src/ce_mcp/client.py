@@ -21,9 +21,11 @@ import os
 import tempfile
 import time
 import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 from .logging_setup import get_logger
 
@@ -67,8 +69,8 @@ _HINTS: tuple[tuple[str, str], ...] = (
     ("no process attached",
      "Call process_list to find the target, then process_attach."),
     ("bridge response",
-     "Cheat Engine is not answering. Confirm CE is open and that the output "
-     "panel shows '[CE-MCP] bridge ready'; if not, re-run ce_mcp_bridge.lua."),
+     ("Cheat Engine is not answering. Confirm CE is open and that the output "
+      "panel shows '[CE-MCP] bridge ready'; if not, re-run ce_mcp_bridge.lua.")),
     ("no active scan",
      "Start one with scan_first."),
     ("still running",
@@ -76,8 +78,8 @@ _HINTS: tuple[tuple[str, str], ...] = (
     ("unknown command",
      "Call ce_routes to list what this bridge build supports."),
     ("createPointerScan",
-     "Pointer scanning is UI-only in Cheat Engine; use pointer_resolve to "
-     "verify a chain you already have."),
+     ("Pointer scanning is UI-only in Cheat Engine; use pointer_resolve to "
+      "verify a chain you already have.")),
 )
 
 
@@ -147,6 +149,7 @@ class CheatEngineClient:
         self.temp_dir = Path(td)
         self._req = self.temp_dir / "cemcp_req.json"
         self._res = self.temp_dir / "cemcp_res.json"
+        self._ipc_lock_path = self.temp_dir / "cemcp_ipc.lock"
         self.timeout = timeout or float(os.getenv("CE_MCP_TIMEOUT", "300"))
         self.poll_interval = float(os.getenv("CE_MCP_POLL", "0.01"))
         self.stats = ClientStats()
@@ -187,14 +190,87 @@ class CheatEngineClient:
             except OSError:
                 pass
 
+    def _try_ipc_lock(self) -> BinaryIO | None:
+        """Try to lock the shared file channel across OS processes.
+
+        Request IDs stop a stale reply being returned as fresh data, but they
+        cannot stop two MCP server processes from deleting each other's fixed
+        request/response files.  A one-byte advisory lock serialises ownership
+        of that channel and is automatically released if a process exits.
+        """
+        self.temp_dir.mkdir(parents=True, exist_ok=True)
+        handle = self._ipc_lock_path.open("a+b")
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+        handle.seek(0)
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:  # pragma: no cover - the project runs on Windows
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (OSError, BlockingIOError):
+            handle.close()
+            return None
+        return handle
+
+    @staticmethod
+    def _release_ipc_lock(handle: BinaryIO) -> None:
+        handle.seek(0)
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:  # pragma: no cover - the project runs on Windows
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+    @asynccontextmanager
+    async def _own_ipc_channel(self, timeout: float) -> AsyncIterator[None]:
+        deadline = time.monotonic() + timeout
+        handle: BinaryIO | None = None
+        while handle is None and time.monotonic() < deadline:
+            try:
+                handle = self._try_ipc_lock()
+            except OSError as exc:
+                raise BridgeError(
+                    f"cannot open the IPC lock file {self._ipc_lock_path}: {exc}",
+                    hint="Check that CE_MCP_TEMP points at a writable directory.",
+                ) from exc
+            if handle is None:
+                await asyncio.sleep(self.poll_interval)
+
+        if handle is None:
+            raise BridgeError(
+                f"another CE-MCP process held the shared IPC channel for {timeout:.0f}s",
+                hint=(
+                    "Let the other tool call finish, or configure both MCP clients "
+                    "to use the same CE_MCP_TEMP so calls can be serialised safely."
+                ),
+            )
+        try:
+            yield
+        finally:
+            self._release_ipc_lock(handle)
+
     # ── public API ───────────────────────────────────────────────────────
     async def call(self, cmd: str, *, timeout: float | None = None, **params: Any) -> Any:
         """Send a command to the CE bridge and return its ``data`` payload.
 
         Raises :class:`BridgeError` on timeout or an ``ok: false`` response.
         """
-        async with self._lock:
-            return await self._call_locked(cmd, timeout, params)
+        budget = self.timeout_for(cmd, timeout, params)
+        async with self._lock, self._own_ipc_channel(budget):
+            return await self._call_locked(cmd, budget, params)
 
     async def _call_locked(self, cmd: str, timeout: float | None,
                            params: dict[str, Any]) -> Any:
@@ -204,7 +280,7 @@ class CheatEngineClient:
             {"id": req_id, "cmd": cmd, "params": body, "protocol": PROTOCOL},
             ensure_ascii=False,
         )
-        budget = self.timeout_for(cmd, timeout, body)
+        budget = float(timeout) if timeout is not None else self.timeout_for(cmd, params=body)
 
         self.stats.calls += 1
         self.stats.last_command = cmd
@@ -235,12 +311,30 @@ class CheatEngineClient:
                     continue
 
                 got_id = payload.get("id")
-                if got_id is not None and got_id != req_id:
+                if got_id is None:
+                    self.stats.errors += 1
+                    raise BridgeError(
+                        "bridge response has no request id; protocol 2 is required",
+                        command=cmd,
+                        hint=(
+                            "Update and reload ce_mcp_bridge.lua. Older bridges cannot "
+                            "safely correlate a late response with the call that made it."
+                        ),
+                    )
+                if got_id != req_id:
                     # A late answer to a call we already gave up on.
                     self.stats.stale_responses += 1
                     log.warning("ignoring response for id=%s while waiting for %s",
                                 got_id, req_id)
                     continue
+                if payload.get("protocol") != PROTOCOL:
+                    self.stats.errors += 1
+                    raise BridgeError(
+                        f"bridge protocol mismatch: expected {PROTOCOL}, got "
+                        f"{payload.get('protocol')!r}",
+                        command=cmd,
+                        hint="Update and reload ce_mcp_bridge.lua so it uses protocol 2.",
+                    )
 
                 elapsed = time.monotonic() - started
                 self.stats.total_seconds += elapsed

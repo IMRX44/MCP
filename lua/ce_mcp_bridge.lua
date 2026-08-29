@@ -791,11 +791,18 @@ CMD.process_detach = function(_)
   -- Cheat Engine has no closeProcess(). The closest supported action is
   -- detaching the debugger; the process handle itself stays open until CE
   -- attaches to something else.
+  if STATE.scan then
+    local ok_reset, reset = pcall(CMD.scan_reset, {})
+    if not ok_reset then error("could not release the previous scan: " .. tostring(reset), 0) end
+    if not reset.reset then
+      error("active scan is still cancelling; poll scan_status until it is " ..
+            "cancelled, then call scan_reset (or force it explicitly)", 0)
+    end
+  end
   local detached_debugger = false
   if CAPS.debug_isDebugging and debug_isDebugging() then
     if CAPS.detachIfPossible then detachIfPossible(); detached_debugger = true end
   end
-  if STATE.scan then pcall(CMD.scan_reset, {}) end
   return {
     debugger_detached = detached_debugger,
     process_handle_released = false,
@@ -1145,6 +1152,14 @@ local function scan_finalize(s)
   s.done = true
   s.elapsed_ms = now_ms() - s.started_ms
 
+  if s.cancelling then
+    s.cancelling = false
+    s.cancelled = true
+    s.error = "cancelled by client"
+    log_info("scan cancellation completed in %dms", s.elapsed_ms)
+    return
+  end
+
   local sc = s.scanner
   local err
   pcall(function() err = sc.ErrorString end)
@@ -1189,8 +1204,13 @@ local function scan_finalize(s)
 end
 
 local function scan_state_view(s, extra)
+  local status
+  if s.cancelling then status = "cancelling"
+  elseif s.cancelled then status = "cancelled"
+  elseif s.done then status = s.error and "error" or "done"
+  else status = "running" end
   local v = {
-    status = s.done and (s.error and "error" or "done") or "running",
+    status = status,
     phase = s.phase,
     value_type = s.value_type, scan_type = s.scan_type,
     protection = s.protection, alignment = s.alignment,
@@ -1274,7 +1294,14 @@ CMD.scan_first = function(p)
   local rounding = ROUNDING[tostring(p.rounding or "rounded"):lower()] or rtRounded
 
   -- Replace any previous scan so we never leak a scanner + result file.
-  if STATE.scan then pcall(CMD.scan_reset, {}) end
+  if STATE.scan then
+    local ok_reset, reset = pcall(CMD.scan_reset, {})
+    if not ok_reset then error("could not release the previous scan: " .. tostring(reset), 0) end
+    if not reset.reset then
+      error("previous scan is still cancelling; poll scan_status until it is " ..
+            "cancelled, then call scan_reset (or force it explicitly)", 0)
+    end
+  end
 
   local regions_applied = apply_regions(p.regions)
 
@@ -1337,6 +1364,8 @@ end
 
 CMD.scan_next = function(p)
   local s = STATE.scan
+  if s and s.cancelling then error("previous scan is still cancelling; poll scan_status", 0) end
+  if s and s.cancelled then error("previous scan was cancelled; call scan_reset first", 0) end
   if not s then error("no active scan — call scan_first first", 0) end
   if s.error then error("previous scan failed: " .. tostring(s.error), 0) end
   if not s.done then
@@ -1422,11 +1451,14 @@ end
 --- Stop a scanner. Graceful by default: Cheat Engine pops a modal warning and
 --- recommends a restart after a *forced* terminate, so only force on request.
 local function stop_scanner(s, force)
-  if not s or not s.scanner then return false, false end
-  if s.done then return false, false end          -- nothing to stop
-  if type(s.scanner.terminateScan) ~= "function" then return false, false end
-  local ok = pcall(function() s.scanner.terminateScan(force == true) end)
-  return ok, (force == true)
+  if not s or not s.scanner then return false, false, "scanner unavailable" end
+  if s.done then return false, false, "scanner already finished" end
+  if type(s.scanner.terminateScan) ~= "function" then
+    return false, false, "terminateScan is unavailable"
+  end
+  local ok, err = pcall(function() s.scanner.terminateScan(force == true) end)
+  if not ok then return false, false, tostring(err) end
+  return true, (force == true), nil
 end
 
 CMD.scan_cancel = function(p)
@@ -1438,16 +1470,37 @@ CMD.scan_cancel = function(p)
                     "Use scan_reset to release its results." }
   end
   local force = (p.force == true)
-  local terminated, forced = stop_scanner(s, force)
-  s.done = true
-  s.error = "cancelled by client"
+  if s.cancelling and not force then
+    return { cancelled = true, status = "cancelling", forced = false,
+             note = "Cancellation is already pending. Poll scan_status; " ..
+                    "retry with force=true only if it will not finish." }
+  end
+  local terminated, forced, terminate_error = stop_scanner(s, force)
+  if force and not terminated then
+    s.cancelling = true
+    log_error("forced scan termination failed: %s", tostring(terminate_error))
+    return {
+      cancelled = false, status = "cancelling", terminate_called = false,
+      forced = false, error = "forced termination failed: " .. tostring(terminate_error),
+      note = "The scanner was retained and may still be running. Poll scan_status; " ..
+             "restart Cheat Engine if it cannot be stopped safely.",
+    }
+  end
+  if forced then
+    s.done = true
+    s.cancelled = true
+    s.error = "cancelled by client"
+  else
+    s.cancelling = true
+  end
   log_warn("scan cancelled by client (terminated=%s force=%s)",
            tostring(terminated), tostring(force))
 
   local note
   if not terminated then
-    note = "This Cheat Engine build has no terminateScan(); the scan may still " ..
-           "be running inside CE. Press 'New Scan' in the Cheat Engine window."
+    note = "Cheat Engine could not accept terminateScan (" ..
+           tostring(terminate_error) .. "); the scan may still be running. " ..
+           "Press 'New Scan' in the Cheat Engine window."
   elseif forced then
     note = "Scan force-terminated. Cheat Engine will warn that subsequent scans " ..
            "may misbehave and recommend a restart — take that seriously."
@@ -1456,7 +1509,10 @@ CMD.scan_cancel = function(p)
            "scan_status. If it will not stop, retry with force=true (Cheat " ..
            "Engine then recommends restarting it)."
   end
-  return { cancelled = true, terminate_called = terminated, forced = forced, note = note }
+  return {
+    cancelled = true, status = forced and "cancelled" or "cancelling",
+    terminate_called = terminated, forced = forced, note = note,
+  }
 end
 
 CMD.scan_results = function(p)
@@ -1467,8 +1523,11 @@ CMD.scan_results = function(p)
     fl, source = s.found, "mcp"
   elseif s and not s.done then
     return { results = arr({}), total = 0, source = "mcp",
-             status = "running", progress = scan_progress(s.scanner),
-             note = "Scan still running — poll scan_status." }
+             status = s.cancelling and "cancelling" or "running",
+             progress = scan_progress(s.scanner),
+             note = s.cancelling and
+                    "Scan cancellation is still unwinding; poll scan_status."
+                    or "Scan still running — poll scan_status." }
   elseif s and s.region_scan then
     return { results = arr({}), total = 0, source = "mcp", status = "snapshot",
              note = s.note }
@@ -1525,10 +1584,42 @@ end
 CMD.scan_reset = function(p)
   local s = STATE.scan
   if not s then return { reset = false, note = "no active scan" } end
+  if not s.done and scan_wait(s.scanner, 0) then scan_finalize(s) end
   local was_running = not s.done
-  -- Only stop a scan that is actually still going, and ask nicely: a forced
-  -- terminate makes Cheat Engine warn that later scans may misbehave.
-  local terminated = stop_scanner(s, p and p.force == true)
+  local force = p and p.force == true
+  local terminated = false
+  if was_running then
+    if force then
+      local _, forced, terminate_error
+      terminated, forced, terminate_error = stop_scanner(s, true)
+      if not terminated or not forced then
+        s.cancelling = true
+        return {
+          reset = false, was_running = true, status = "cancelling",
+          terminate_called = false, forced = false,
+          error = "forced termination failed: " .. tostring(terminate_error),
+          note = "The scanner was retained because Cheat Engine did not confirm " ..
+                 "termination. Restart Cheat Engine if it cannot be stopped safely.",
+        }
+      end
+      s.done = true
+      s.cancelling = false
+      s.cancelled = true
+      s.error = "cancelled by client"
+    else
+      if not s.cancelling then
+        terminated = stop_scanner(s, false)
+        s.cancelling = true
+      end
+      return {
+        reset = false, was_running = true, status = "cancelling",
+        terminate_called = terminated,
+        note = "The running scan was asked to stop but has not finished " ..
+               "unwinding. Poll scan_status, then call scan_reset again; use " ..
+               "force=true only if graceful cancellation will not finish.",
+      }
+    end
+  end
   if s.found then pcall(function() s.found.deinitialize() end) end
   if s.found then pcall(function() s.found.destroy() end) end
   if s.scanner then pcall(function() s.scanner.destroy() end) end
@@ -2039,6 +2130,17 @@ end
 local function dispatch(req)
   local id = req and req.id
   local cmd_name = req and req.cmd
+  if req and req.protocol ~= PROTOCOL then
+    return {
+      id = id, ok = false, protocol = PROTOCOL,
+      error = ("protocol mismatch: bridge requires %d, request supplied %s")
+        :format(PROTOCOL, tostring(req.protocol)),
+    }
+  end
+  if type(id) ~= "string" or id == "" then
+    return { id = id, ok = false, protocol = PROTOCOL,
+             error = "protocol 2 requests require a non-empty string 'id'" }
+  end
   if not cmd_name then
     return { id = id, ok = false, error = "request has no 'cmd' field" }
   end
@@ -2092,6 +2194,7 @@ local function service_once()
   end
 
   response.bridge_version = BRIDGE_VERSION
+  response.protocol = PROTOCOL
   local encoded
   local ok, e = pcall(function() encoded = json_encode(response) end)
   if not ok then

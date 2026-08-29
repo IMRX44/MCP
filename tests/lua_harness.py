@@ -10,6 +10,7 @@ from __future__ import annotations
 import ctypes
 import os
 from pathlib import Path
+from typing import Self
 
 CE_DIRS = [
     r"C:\Program Files\Cheat Engine",
@@ -85,7 +86,7 @@ class Lua:
             self._lib.lua_close(self.L)
             self.L = None
 
-    def __enter__(self) -> "Lua":
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *exc: object) -> None:

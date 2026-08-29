@@ -144,7 +144,10 @@ function createMemScan()
   function sc.getProgress()
     return { TotalAddressesToScan = 1000, CurrentlyScanned = 1000, ResultsFound = 2 }
   end
-  function sc.terminateScan(force) sc.terminated = (force == true) end
+  function sc.terminateScan(force)
+    if FAKE.terminate_error then error(FAKE.terminate_error) end
+    sc.terminated = (force == true)
+  end
   function sc.setOnlyOneResult(v) sc.only_one = v end
   function sc.saveCurrentResults(n) sc.saved = n end
   function sc.destroy() sc.destroyed = true end
@@ -216,7 +219,7 @@ local function call(cmd, params, id)
     else enc = tostring(v) end
     parts[#parts + 1] = ('"%s":%s'):format(k, enc)
   end
-  local body = ('{"id":"%s","cmd":"%s","params":{%s}}')
+  local body = ('{"id":"%s","cmd":"%s","params":{%s},"protocol":2}')
     :format(id or "t1", cmd, table.concat(parts, ","))
   return raw_call(body)
 end
@@ -244,6 +247,7 @@ do
   ok("ping succeeds", has(r, '"ok":true'), r)
   ok("ping echoes the request id", has(r, '"id":"abc-123"'), r)
   ok("ping reports the bridge version", has(r, '"bridge_version":"2.0.0"'), r)
+  ok("ping reports protocol 2", has(r, '"protocol":2'), r)
 
   local r2 = call("ping", {}, "different-id")
   ok("a second call carries its own id", has(r2, '"id":"different-id"'), r2)
@@ -252,10 +256,18 @@ do
   ok("unknown command is rejected", has(r3, '"ok":false') and has(r3, "unknown command"), r3)
   ok("unknown command lists known routes", has(r3, '"known"'), r3)
 
+  local old = raw_call('{"id":"old","cmd":"ping","params":{}}')
+  ok("requests without a protocol are rejected",
+     has(old, '"ok":false') and has(old, "protocol mismatch"), old)
+
+  local no_id = raw_call('{"cmd":"ping","params":{},"protocol":2}')
+  ok("protocol 2 requires a request id",
+     has(no_id, '"ok":false') and has(no_id, "non-empty string"), no_id)
+
   local r4 = raw_call("{this is not json")
   ok("malformed JSON is reported", has(r4, '"ok":false') and has(r4, "malformed JSON"), r4)
 
-  local r5 = raw_call('{"id":"x","params":{}}')
+  local r5 = raw_call('{"id":"x","params":{},"protocol":2}')
   ok("missing cmd is reported", has(r5, "no 'cmd' field"), r5)
 
   local r6 = call("ce_routes", {})
@@ -412,7 +424,14 @@ do
   local slow = createMemScan
   createMemScan = function()
     local sc = slow()
-    sc.waitTillDone = function(_) return false end
+    local cancel_polls = 0
+    sc.waitTillDone = function(_)
+      if sc.terminated == false then
+        cancel_polls = cancel_polls + 1
+        return cancel_polls >= 2
+      end
+      return false
+    end
     return sc
   end
 
@@ -420,11 +439,26 @@ do
   local sc = FAKE.last_scanner
   local cx = call("scan_cancel", {})
   ok("a running scan is cancelled", has(cx, '"cancelled":true'), cx)
+  ok("graceful cancellation remains pollable", has(cx, '"status":"cancelling"'), cx)
   ok("graceful cancel is not forced", has(cx, '"forced":false'), cx)
   ok("graceful cancel passes force=false", sc.terminated == false, tostring(sc.terminated))
   ok("graceful cancel explains the escalation", has(cx, "force=true"), cx)
+  local pending_results = call("scan_results", {})
+  ok("scan_results preserves the cancelling state",
+     has(pending_results, '"status":"cancelling"'), pending_results)
 
-  call("scan_reset", {})
+  local early = call("scan_reset", {})
+  ok("reset waits for a gracefully cancelling scanner", has(early, '"reset":false'), early)
+  ok("reset does not destroy a scanner that is still unwinding", sc.destroyed == false,
+     tostring(sc.destroyed))
+
+  local settled = call("scan_status", {})
+  ok("scan_status observes graceful cancellation completing",
+     has(settled, '"status":"cancelled"'), settled)
+  local released = call("scan_reset", {})
+  ok("settled cancelled scan can be released", has(released, '"reset":true'), released)
+  ok("settled cancelled scanner is destroyed", sc.destroyed == true, tostring(sc.destroyed))
+
   call("scan_first", { value = 1, wait = 0 })
   local sc2 = FAKE.last_scanner
   local cf = call("scan_cancel", { force = true })
@@ -432,6 +466,27 @@ do
   ok("force cancel warns about the CE restart advice", has(cf, "recommend a restart"), cf)
 
   call("scan_reset", {})
+
+  call("scan_first", { value = 1, wait = 0 })
+  local sc3 = FAKE.last_scanner
+  FAKE.terminate_error = "scanner refused termination"
+  local failed_cancel = call("scan_cancel", { force = true })
+  ok("failed forced cancel is not reported as forced",
+     has(failed_cancel, '"forced":false') and has(failed_cancel, '"cancelled":false'),
+     failed_cancel)
+  ok("failed forced cancel keeps the scanner", sc3.destroyed == false,
+     tostring(sc3.destroyed))
+
+  local failed_reset = call("scan_reset", { force = true })
+  ok("failed forced reset is not reported as reset",
+     has(failed_reset, '"reset":false') and has(failed_reset, "forced termination failed"),
+     failed_reset)
+  ok("failed forced reset does not destroy the scanner", sc3.destroyed == false,
+     tostring(sc3.destroyed))
+
+  FAKE.terminate_error = nil
+  local cleanup = call("scan_reset", { force = true })
+  ok("scanner can be released after termination recovers", has(cleanup, '"reset":true'), cleanup)
   createMemScan = slow
 end
 
@@ -619,17 +674,17 @@ end
 -- ══════════════════════════════════════════════════════════════════════════
 print("\njson codec")
 do
-  local r = raw_call('{"id":"j1","cmd":"lua_execute","params":{"code":"print(\\"hi\\\\ttab\\")"}}')
+  local r = raw_call('{"id":"j1","cmd":"lua_execute","params":{"code":"print(\\"hi\\\\ttab\\")"},"protocol":2}')
   ok("escaped strings survive the round trip", has(r, "hi\\ttab"), r)
 
-  local u = raw_call('{"id":"j2","cmd":"process_list","params":{"filter":"\\u0067ame"}}')
+  local u = raw_call('{"id":"j2","cmd":"process_list","params":{"filter":"\\u0067ame"},"protocol":2}')
   ok("\\u escapes decode", has(u, "game.exe"), u)
 
   local empty = call("memory_read_batch", { reads = {} })
   ok("empty arrays encode as []", has(empty, '"reads":[]'), empty)
 
   local nested = raw_call('{"id":"j3","cmd":"pointer_resolve","params":' ..
-                          '{"base":"0x140000000","offsets":[16,32]}}')
+                          '{"base":"0x140000000","offsets":[16,32]},"protocol":2}')
   ok("nested arrays decode", has(nested, '"resolved"'), nested)
 end
 
@@ -639,7 +694,7 @@ end
 print("\nre-entrancy")
 do
   os.remove(RES)
-  write(REQ, '{"id":"re1","cmd":"ping","params":{}}')
+  write(REQ, '{"id":"re1","cmd":"ping","params":{},"protocol":2}')
   -- Simulate the timer firing again while the first call is still in flight by
   -- invoking OnTimer from inside a handler via lua_execute.
   local depth = 0

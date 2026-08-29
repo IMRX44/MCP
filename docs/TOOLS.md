@@ -156,13 +156,13 @@ Narrow the active scan. ``scan_type``: exact, bigger, smaller, between, changed,
 
 Arguments: —
 
-Report the active scan: status, progress percentage, match count and elapsed time. Poll this while a scan reports 'running'. With no MCP scan active it reports Cheat Engine's own GUI scan instead.
+Report the active scan: status, progress percentage, match count and elapsed time. Poll this while a scan reports 'running' or 'cancelling'. With no MCP scan active it reports Cheat Engine's own GUI scan instead.
 
 ### `scan_cancel`
 
 Arguments: force
 
-Abort the running scan inside Cheat Engine. Use this rather than abandoning a call — a scan started here keeps running in CE and will block every later request until it finishes. The default asks the scanner to stop at its next safe point. Only pass ``force=True`` if a graceful stop will not take: Cheat Engine then pops a modal warning that later scans may misbehave and recommends restarting it.
+Abort the running scan inside Cheat Engine. Use this rather than abandoning a call — a scan started here keeps running in CE and will block every later request until it finishes. The default asks the scanner to stop at its next safe point and returns status='cancelling'; poll scan_status until it becomes 'cancelled'. Only pass ``force=True`` if a graceful stop will not take: Cheat Engine then pops a modal warning that later scans may misbehave and recommends restarting it.
 
 ### `scan_results`
 
@@ -180,7 +180,7 @@ Save the current scan results under ``name`` so a later scan_next can compare ag
 
 Arguments: force
 
-Discard the active scan and free its result file. A scan that is still running is asked to stop first, gracefully. Finished scans are simply released — they are never terminated, which is what makes Cheat Engine warn about subsequent scans misbehaving.
+Discard the active scan and free its result file. A running scan is first asked to stop gracefully; while it is still unwinding this returns reset=False and status='cancelling'. Poll scan_status and call scan_reset again after it settles. Finished scans are simply released. ``force=True`` is an explicit last resort because Cheat Engine warns that later scans may misbehave after forced termination.
 
 ### `scan_aob`
 

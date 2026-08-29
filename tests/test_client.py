@@ -9,13 +9,17 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import os
+import sys
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from ce_mcp import server
-from ce_mcp.client import COMMAND_TIMEOUTS, BridgeError, CheatEngineClient
+from ce_mcp import __version__, server
+from ce_mcp.client import COMMAND_TIMEOUTS, PROTOCOL, BridgeError, CheatEngineClient
+from ce_mcp.logging_setup import _resolve_log_level
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -53,6 +57,7 @@ class FakeBridge:
                 payload = self.handler(req)
                 if self.echo_id and "id" not in payload:
                     payload["id"] = req.get("id")
+                payload.setdefault("protocol", PROTOCOL)
                 self.res.write_text(json.dumps(payload), encoding="utf-8")
             await asyncio.sleep(0.005)
 
@@ -87,7 +92,7 @@ def client(tmp_path: Path) -> CheatEngineClient:
 def test_all_tools_registered() -> None:
     tools = asyncio.run(server.mcp.list_tools())
     names = {t.name for t in tools}
-    for expected in {
+    for expected in (
         "process_attach", "memory_read", "memory_write",
         "scan_first", "scan_next", "scan_aob",
         "table_add", "table_freeze", "pointer_resolve",
@@ -96,15 +101,35 @@ def test_all_tools_registered() -> None:
         "ce_diagnostics", "ce_debug_log", "ce_capabilities",
         "scan_status", "scan_cancel", "scan_estimate", "scan_save_results",
         "job_status", "job_list", "job_cancel",
-    }:
+    ):
         assert expected in names, f"missing tool: {expected}"
     assert len(names) >= 50
+
+
+def test_mcp_handshake_advertises_package_version() -> None:
+    assert server.mcp._mcp_server.version == __version__
+
+
+def test_trace_logging_maps_to_python_debug() -> None:
+    assert _resolve_log_level("trace") == logging.DEBUG
 
 
 def test_every_tool_is_documented() -> None:
     tools = asyncio.run(server.mcp.list_tools())
     undocumented = [t.name for t in tools if not (t.description or "").strip()]
     assert not undocumented, f"tools without a description: {undocumented}"
+
+
+def test_setup_docs_describe_file_ipc_only() -> None:
+    root = Path(__file__).resolve().parent.parent
+    setup_text = "\n".join(
+        (root / path).read_text(encoding="utf-8")
+        for path in ("README.md", "examples/claude_desktop_config.json")
+    )
+    for retired in ("37712", "CE_MCP_HOST", "CE_MCP_PORT", "HTTP client"):
+        assert retired not in setup_text, f"retired transport reference: {retired}"
+    assert "CE_MCP_TEMP" in setup_text
+    assert "cemcp_ipc.lock" in setup_text
 
 
 def test_pointer_scan_tool_was_removed() -> None:
@@ -130,6 +155,7 @@ async def test_request_carries_a_unique_id(bridge: FakeBridge, client: CheatEngi
     ids = [r["id"] for r in bridge.seen]
     assert len(ids) == 2 and ids[0] != ids[1]
     assert all(isinstance(i, str) and i for i in ids)
+    assert all(r["protocol"] == PROTOCOL for r in bridge.seen)
 
 
 @pytest.mark.asyncio
@@ -176,7 +202,10 @@ async def test_stale_response_is_not_mistaken_for_the_answer(
 ) -> None:
     """A leftover response from an abandoned call must never be returned."""
     (tmp_path / "cemcp_res.json").write_text(
-        json.dumps({"id": "an-old-call", "ok": True, "data": {"stale": True}}),
+        json.dumps({
+            "id": "an-old-call", "protocol": PROTOCOL,
+            "ok": True, "data": {"stale": True},
+        }),
         encoding="utf-8",
     )
     result = await client.call("ping")
@@ -197,9 +226,13 @@ async def test_mismatched_id_is_skipped_and_waiting_continues(
             if req.exists():
                 real_id = json.loads(req.read_text())["id"]
                 req.unlink(missing_ok=True)
-                res.write_text(json.dumps({"id": "wrong", "ok": True, "data": "no"}))
+                res.write_text(json.dumps({
+                    "id": "wrong", "protocol": PROTOCOL, "ok": True, "data": "no",
+                }))
                 await asyncio.sleep(0.05)
-                res.write_text(json.dumps({"id": real_id, "ok": True, "data": "yes"}))
+                res.write_text(json.dumps({
+                    "id": real_id, "protocol": PROTOCOL, "ok": True, "data": "yes",
+                }))
                 return
 
     task = asyncio.create_task(answer_wrong_then_right())
@@ -215,6 +248,89 @@ async def test_calls_are_serialised(bridge: FakeBridge, client: CheatEngineClien
     assert len(results) == 5
     assert len(bridge.seen) == 5
     assert len({r["id"] for r in bridge.seen}) == 5
+
+
+@pytest.mark.asyncio
+async def test_idless_bridge_response_is_rejected(
+    bridge: FakeBridge, client: CheatEngineClient
+) -> None:
+    """Protocol v2 must never accept an uncorrelated old-bridge response."""
+    bridge.echo_id = False
+    with pytest.raises(BridgeError) as exc:
+        await client.call("ping")
+    assert "no request id" in str(exc.value)
+    assert "Update and reload" in (exc.value.hint or "")
+
+
+@pytest.mark.asyncio
+async def test_wrong_bridge_protocol_is_rejected(
+    bridge: FakeBridge, client: CheatEngineClient
+) -> None:
+    bridge.handler = lambda req: {
+        "ok": True, "protocol": 1, "data": {"unsafe": True},
+    }
+    with pytest.raises(BridgeError) as exc:
+        await client.call("ping")
+    assert "protocol mismatch" in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_two_clients_share_the_file_channel_safely(
+    tmp_path: Path, bridge: FakeBridge
+) -> None:
+    """The lock must work across client instances, not only within one client."""
+    bridge.delay = 0.02
+    first = CheatEngineClient(temp_dir=str(tmp_path), timeout=3.0)
+    second = CheatEngineClient(temp_dir=str(tmp_path), timeout=3.0)
+    calls = [first.call("ping", owner="first", n=i) for i in range(3)]
+    calls += [second.call("ping", owner="second", n=i) for i in range(3)]
+    results = await asyncio.gather(*calls)
+    assert len(results) == 6
+    assert len(bridge.seen) == 6
+    assert {r["params"]["owner"] for r in bridge.seen} == {"first", "second"}
+
+
+@pytest.mark.skipif(os.name != "nt", reason="validates the Windows production lock")
+@pytest.mark.asyncio
+async def test_ipc_lock_waits_for_another_process_and_recovers_after_crash(
+    tmp_path: Path, bridge: FakeBridge
+) -> None:
+    lock_path = tmp_path / "cemcp_ipc.lock"
+    holder_code = (
+        "import msvcrt,sys; "
+        "f=open(sys.argv[1],'a+b'); "
+        "f.seek(0,2); "
+        "f.write(b'\\0') if f.tell()==0 else None; "
+        "f.flush(); f.seek(0); "
+        "msvcrt.locking(f.fileno(),msvcrt.LK_NBLCK,1); "
+        "print('locked',flush=True); sys.stdin.read()"
+    )
+    holder = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        holder_code,
+        str(lock_path),
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        assert holder.stdout is not None
+        assert (await holder.stdout.readline()).strip() == b"locked"
+
+        blocked = CheatEngineClient(temp_dir=str(tmp_path), timeout=0.15)
+        with pytest.raises(BridgeError) as exc:
+            await blocked.call("unlisted_command")
+        assert "another CE-MCP process" in str(exc.value)
+        assert not (tmp_path / "cemcp_req.json").exists()
+        assert not (tmp_path / "cemcp_res.json").exists()
+    finally:
+        holder.kill()
+        await holder.wait()
+
+    recovered = CheatEngineClient(temp_dir=str(tmp_path), timeout=3.0)
+    result = await recovered.call("ping")
+    assert result["cmd"] == "ping"
 
 
 # ─────────────────────────────────────────────────────────────────────────────

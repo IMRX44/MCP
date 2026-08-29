@@ -32,9 +32,10 @@ embedded Lua engine. `ce-mcp` bridges that gap with two cooperating halves:
 
 The two talk through a pair of temp files (`%TEMP%\cemcp_req.json` /
 `cemcp_res.json`) rather than a socket, so there is no LuaSocket dependency and
-nothing to install inside Cheat Engine. Every request carries an `id` that the
-bridge echoes back, so a late reply to a call that already timed out can never
-be mistaken for the answer to the next one.
+nothing to install inside Cheat Engine. Every protocol-2 request carries an
+`id` that the bridge must echo back, so a late reply to a call that already
+timed out cannot be mistaken for the answer to the next one. An OS-level lock
+also serialises separate MCP client processes that share the file channel.
 
 ---
 
@@ -82,7 +83,7 @@ pip install -e .
 1. Open Cheat Engine.
 2. **Table ▸ Cheat Table Lua Script** (`Ctrl+Alt+L`).
 3. Paste the contents of [`lua/ce_mcp_bridge.lua`](lua/ce_mcp_bridge.lua) and click **Execute**.
-4. The CE console prints: `[CE-MCP] listening on http://127.0.0.1:37712`.
+4. The CE console prints: `[CE-MCP] bridge ready - v2.0.0 protocol 2`.
 
 > 💡 To auto-start it every time, drop the file into Cheat Engine's
 > `autorun/` folder.
@@ -143,16 +144,22 @@ The Python server reads these environment variables:
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
-| `CE_MCP_HOST` | `127.0.0.1` | Bridge host |
-| `CE_MCP_PORT` | `37712` | Bridge port (must match the Lua file) |
-| `CE_MCP_TIMEOUT` | `60` | HTTP timeout (s) — raise for long scans |
+| `CE_MCP_TEMP` | OS user temp directory | Directory containing `cemcp_req.json`, `cemcp_res.json`, and `cemcp_ipc.lock`. It must resolve to the same writable directory for Cheat Engine and every MCP client. Set it in the environment that launches both processes if their temp directories differ. |
+| `CE_MCP_TIMEOUT` | `300` | Fallback timeout in seconds for commands without a command-specific limit. Common probes fail faster; a scan call automatically allows its requested `wait` plus 15 seconds. |
+| `CE_MCP_POLL` | `0.01` | Python-side response/lock polling interval in seconds. |
+| `CE_MCP_LOG_LEVEL` | `info` | Python and bridge log level (`error`, `warn`, `info`, `debug`, or `trace`; Python maps `trace` to its most verbose `debug` level). |
+| `CE_MCP_LOG_FILE` | `1` | Set to `0` before launching Cheat Engine to disable `%TEMP%\cemcp_bridge.log`. |
 
 ---
 
 ## 🔒 Security notes
 
-- The bridge binds to **loopback only** and has **no authentication** — anything
-  that can reach `localhost:37712` can drive Cheat Engine. Don't expose the port.
+- The bridge opens no network listener. Access is controlled by the filesystem
+  permissions on `CE_MCP_TEMP`; use a user-private directory and do not point it
+  at a shared or untrusted location.
+- Any local process that can modify the IPC files can ask Cheat Engine to read,
+  write, allocate, debug, or execute Lua in the attached target. Treat the temp
+  directory as privileged while the bridge is running.
 - This is a debugging / reverse-engineering tool. Use it on software **you own or
   are authorised to analyse**, and respect the terms of service of online games.
 
@@ -162,8 +169,12 @@ The Python server reads these environment variables:
 
 - **No external Lua dependencies.** The bridge implements its own recursive-descent
   JSON encoder/decoder, so it runs on a stock Cheat Engine install.
-- **Non-blocking server.** The HTTP accept loop runs on a CE timer, so it never
-  freezes the Cheat Engine UI.
+- **Timer-driven dispatcher.** Cheat Engine polls the request file from a Lua
+  timer. Scans return a running state after a bounded wait and are then polled
+  with `scan_status`, keeping long scan work out of later MCP calls.
+- **Single shared channel.** Calls within one server use an async lock and calls
+  from separate server processes use `cemcp_ipc.lock`, preventing either client
+  from deleting the other's request or response.
 - **Stateful scan session.** `scan_first` creates a CE `MemScan`/`FoundList` that
   later `scan_next`/`scan_results`/`scan_reset` calls operate on — mirroring the UI.
 - **Clean error contract.** Every response is `{ ok, data | error }`; the Python
@@ -178,10 +189,11 @@ See [`docs/TOOLS.md`](docs/TOOLS.md) for the full per-tool reference.
 ```
 MCP/
 ├── lua/
-│   └── ce_mcp_bridge.lua        # In-Cheat-Engine HTTP/JSON bridge
+│   └── ce_mcp_bridge.lua        # In-Cheat-Engine temp-file/JSON bridge
 ├── src/ce_mcp/
 │   ├── server.py                # FastMCP server + all tool definitions
-│   ├── client.py                # Async HTTP client for the bridge
+│   ├── client.py                # Correlated, cross-process-safe file IPC client
+│   ├── logging_setup.py         # stderr-only structured logging
 │   ├── __main__.py              # python -m ce_mcp
 │   └── __init__.py
 ├── examples/

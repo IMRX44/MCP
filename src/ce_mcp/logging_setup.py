@@ -5,7 +5,7 @@ stdout that is not a JSON-RPC frame corrupts the session, so every log record
 goes to stderr and, optionally, a rotating file.
 
 Environment:
-  CE_MCP_LOG_LEVEL   debug | info | warning | error   (default: info)
+  CE_MCP_LOG_LEVEL   trace | debug | info | warning | error   (default: info)
   CE_MCP_LOG_FILE    path, or "0" to disable file logging
                      (default: %TEMP%/cemcp_client.log)
   CE_MCP_LOG_STDERR  "0" to silence stderr output
@@ -28,6 +28,14 @@ def default_log_path() -> Path:
     return Path(os.getenv("CE_MCP_TEMP") or tempfile.gettempdir()) / "cemcp_client.log"
 
 
+def _resolve_log_level(value: str | None) -> int:
+    """Map the bridge's ``trace`` spelling to Python's most verbose level."""
+    name = (value or "info").upper()
+    if name == "TRACE":
+        return logging.DEBUG
+    return getattr(logging, name, logging.INFO)
+
+
 def setup_logging() -> logging.Logger:
     """Configure and return the ce-mcp logger. Safe to call repeatedly."""
     global _configured
@@ -36,7 +44,7 @@ def setup_logging() -> logging.Logger:
         return log
 
     level_name = (os.getenv("CE_MCP_LOG_LEVEL") or "info").upper()
-    level = getattr(logging, level_name, logging.INFO)
+    level = _resolve_log_level(level_name)
     log.setLevel(level)
     log.propagate = False
 
