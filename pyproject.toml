@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ce-mcp"
-version = "1.0.0"
+version = "2.0.0"
 description = "A Model Context Protocol server that gives AI agents full control of Cheat Engine."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -18,8 +18,7 @@ classifiers = [
     "Topic :: Software Development :: Debuggers",
 ]
 dependencies = [
-    "mcp[cli]>=1.2.0",
-    "httpx>=0.27.0",
+    "mcp[cli]>=1.2.0,<2",
 ]
 
 [project.optional-dependencies]
