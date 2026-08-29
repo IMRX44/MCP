@@ -11,11 +11,11 @@ tools.
 ```
 "Attach to the game, find my health value, then freeze it."
         │
-   ┌────▼─────────┐    MCP/stdio    ┌──────────────┐   HTTP/JSON   ┌──────────────┐
-   │   AI agent   │ ───────────────▶│  ce-mcp       │ ─────────────▶│ Cheat Engine │
-   │ (Claude etc) │ ◀───────────────│ (Python,      │ ◀─────────────│ Lua bridge   │
-   └──────────────┘                 │  FastMCP)     │  37712        │ (in-process) │
-                                    └──────────────┘                └──────────────┘
+   ┌────▼─────────┐    MCP/stdio    ┌──────────────┐   temp-file   ┌──────────────┐
+   │   AI agent   │ ───────────────▶│  ce-mcp      │ ─────────────▶│ Cheat Engine │
+   │ (Claude etc) │ ◀───────────────│ (Python,     │ ◀─────────────│ Lua bridge   │
+   └──────────────┘                 │  FastMCP)    │  JSON + id    │ (in-process) │
+                                    └──────────────┘               └──────────────┘
 ```
 
 ---
@@ -27,29 +27,35 @@ embedded Lua engine. `ce-mcp` bridges that gap with two cooperating halves:
 
 | Half | Lives in | Job |
 |------|----------|-----|
-| **Lua bridge** (`lua/ce_mcp_bridge.lua`) | Inside Cheat Engine | Tiny loopback HTTP/JSON server that calls CE's Lua API directly — scanning, reading/writing, AA, debugger, Mono. Ships its own hand-written JSON parser (no external deps). |
-| **MCP server** (`src/ce_mcp/`) | Python process | Speaks MCP over stdio to the agent, translates each tool call into an HTTP request to the bridge. Built on the official `mcp` SDK (FastMCP). |
+| **Lua bridge** (`lua/ce_mcp_bridge.lua`) | Inside Cheat Engine | Calls CE's Lua API directly — scanning, reading/writing, AA, debugger, Mono. Ships its own JSON codec, structured logging and a job scheduler. No external deps. |
+| **MCP server** (`src/ce_mcp/`) | Python process | Speaks MCP over stdio to the agent and translates each tool call into a bridge command. Built on the official `mcp` SDK (FastMCP). |
 
-This keeps the agent-facing contract clean and typed, while all the
-CE-specific magic stays where it has to be — inside Cheat Engine.
+The two talk through a pair of temp files (`%TEMP%\cemcp_req.json` /
+`cemcp_res.json`) rather than a socket, so there is no LuaSocket dependency and
+nothing to install inside Cheat Engine. Every request carries an `id` that the
+bridge echoes back, so a late reply to a call that already timed out can never
+be mistaken for the answer to the next one.
 
 ---
 
 ## 🛠️ Capabilities
 
-**40+ tools** covering effectively the whole manual workflow:
+**54 tools** covering effectively the whole manual workflow — see
+[docs/TOOLS.md](docs/TOOLS.md) for the generated reference.
 
 | Group | Tools |
 |-------|-------|
+| **Connectivity & diagnostics** | `ce_status`, `ce_version`, `ce_routes`, `ce_capabilities`, `ce_diagnostics`, `ce_debug_log`, `ce_debug_level`, `ce_debug_state` |
 | **Process** | `process_list`, `process_attach`, `process_detach`, `process_current`, `process_modules`, `process_regions` |
 | **Memory** | `memory_read`, `memory_read_batch`, `memory_write`, `memory_dump`, `memory_alloc`, `memory_free` |
-| **Scanning** | `scan_first`, `scan_next`, `scan_results`, `scan_reset`, `scan_aob` |
+| **Scanning** | `scan_estimate`, `scan_first`, `scan_next`, `scan_status`, `scan_cancel`, `scan_results`, `scan_save_results`, `scan_reset`, `scan_aob` |
 | **Cheat table** | `table_list`, `table_add`, `table_remove`, `table_set_value`, `table_freeze`, `table_enable`, `table_hotkey`, `table_save`, `table_load`, `table_clear` |
-| **Pointers** | `pointer_resolve`, `pointer_scan` |
+| **Pointers** | `pointer_resolve` |
 | **Code** | `disassemble`, `assemble`, `auto_assemble` |
-| **Debugger** | `find_what_writes`, `find_what_accesses`, `breakpoint` |
+| **Debugger** | `find_what_writes`, `find_what_accesses`, `breakpoint`, `breakpoint_list` |
+| **Jobs** | `job_status`, `job_list`, `job_cancel` |
 | **Mono/Unity** | `mono_init`, `mono_classes` |
-| **Misc** | `speedhack`, `lua_execute` (raw Lua escape hatch), `ce_status`, `ce_version`, `ce_routes` |
+| **Misc** | `speedhack`, `lua_execute` (raw Lua escape hatch) |
 
 Every scan type Cheat Engine supports is available: `exact`, `bigger`,
 `smaller`, `between`, `unknown`, `changed`, `unchanged`, `increased`,

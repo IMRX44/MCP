@@ -6,4 +6,4 @@ disassemble/assemble, run Auto Assembler scripts, inspect Mono/Unity games,
 and more — over a small localhost HTTP bridge that runs inside Cheat Engine.
 """
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"
